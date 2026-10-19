@@ -1,0 +1,161 @@
+{
+  "listings": [
+    {
+      "id": "L1",
+      "title": "Meeting Room Alpha",
+      "space_type": "Meeting room",
+      "promises": [
+        "Projector with HDMI",
+        "High-speed Wi-Fi",
+        "Whiteboard",
+        "Seats up to 8"
+      ]
+    },
+    {
+      "id": "L2",
+      "title": "Private Cabin 3",
+      "space_type": "Private cabin",
+      "promises": [
+        "Lockable private cabin for 4",
+        "24x7 access with keycard",
+        "Air conditioning"
+      ]
+    },
+    {
+      "id": "L3",
+      "title": "Meeting Room Beta",
+      "space_type": "Meeting room",
+      "promises": [
+        "Seats up to 6",
+        "Wi-Fi",
+        "TV screen"
+      ]
+    },
+    {
+      "id": "L4",
+      "title": "Photo Studio Loft",
+      "space_type": "Studio",
+      "promises": [
+        "Natural light studio",
+        "Furniture and props included",
+        "Backdrop stands"
+      ]
+    },
+    {
+      "id": "L5",
+      "title": "Hot Desk Zone A",
+      "space_type": "Hot desk",
+      "promises": [
+        "Open-plan coworking floor",
+        "Power outlet at every desk",
+        "Wi-Fi",
+        "Free tea and coffee"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "C-1001",
+      "customer": "Ananya Sharma",
+      "booking": {
+        "amount": 2000,
+        "date": "2026-10-12",
+        "time": "10:00",
+        "space_type": "Meeting room",
+        "cancelled_minutes_before": null
+      },
+      "listing_id": "L1",
+      "complaint": "I paid Rs 2,000 for Meeting Room Alpha. The advertised projector did not work at all and the Wi-Fi kept disconnecting during my client presentation. I reported it to the front desk at 10:15.",
+      "owner_response": "The room was available and usable. We admit the projector lamp had a known fault that day. Our Wi-Fi logs show no outage, so we do not accept the Wi-Fi claim.",
+      "evidence": [
+        "Front desk ticket #4521 logged 10:15 - projector not working",
+        "Photo: projector_error_screen.jpg"
+      ],
+      "status": "Manual Review",
+      "owner_id": null,
+      "legacy_seed": true
+    },
+    {
+      "id": "C-1002",
+      "customer": "Rohit Verma",
+      "booking": {
+        "amount": 3500,
+        "date": "2026-10-13",
+        "time": "09:00",
+        "space_type": "Private cabin",
+        "cancelled_minutes_before": null
+      },
+      "listing_id": "L2",
+      "complaint": "I reserved Private Cabin 3 for the full day. When I arrived at 9:00 my keycard was rejected and the cabin was occupied by someone else. Nobody offered me another space.",
+      "owner_response": "The cabin was double-booked by mistake by our staff. We apologise.",
+      "evidence": [
+        "Door access log: keycard rejected 09:02",
+        "Staff message admitting double booking"
+      ],
+      "status": "New",
+      "owner_id": null,
+      "legacy_seed": true
+    },
+    {
+      "id": "C-1003",
+      "customer": "Meera Iyer",
+      "booking": {
+        "amount": 1500,
+        "date": "2026-10-14",
+        "time": "15:00",
+        "space_type": "Meeting room",
+        "cancelled_minutes_before": 30
+      },
+      "listing_id": "L3",
+      "complaint": "My meeting got postponed so I cancelled the booking 30 minutes before the start time. I want a full refund of Rs 1,500.",
+      "owner_response": "The room was held for her and we turned away another customer. The cancellation came 30 minutes before the start.",
+      "evidence": [
+        "Cancellation timestamp in booking system: 14:30"
+      ],
+      "status": "AI Analyzed",
+      "owner_id": null,
+      "legacy_seed": true
+    },
+    {
+      "id": "C-1004",
+      "customer": "Karan Malhotra",
+      "booking": {
+        "amount": 2500,
+        "date": "2026-10-15",
+        "time": "11:00",
+        "space_type": "Studio",
+        "cancelled_minutes_before": null
+      },
+      "listing_id": "L4",
+      "complaint": "The owner says I damaged a chair and wants to deduct Rs 1,500 from my deposit. I did not damage anything. The chair was already loose when I arrived.",
+      "owner_response": "A chair leg was broken after this customer's session. Nobody else used the studio that day, so he is responsible.",
+      "evidence": [],
+      "status": "New",
+      "owner_id": null,
+      "legacy_seed": true
+    },
+    {
+      "id": "C-1005",
+      "customer": "Sneha Kapoor",
+      "booking": {
+        "amount": 800,
+        "date": "2026-10-16",
+        "time": "10:00",
+        "space_type": "Hot desk",
+        "cancelled_minutes_before": null
+      },
+      "listing_id": "L5",
+      "complaint": "The coworking floor was very noisy because of phone calls and a team meeting nearby. I could not concentrate and want a refund.",
+      "owner_response": "This is an open-plan floor and some background noise is normal. We did not receive any complaint at the front desk that day.",
+      "evidence": [],
+      "status": "New",
+      "owner_id": null,
+      "legacy_seed": true
+    }
+  ],
+  "users": [],
+  "sessions": {},
+  "analyses": {},
+  "decisions": {},
+  "decision_history": {}
+}

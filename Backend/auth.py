@@ -28,7 +28,7 @@ def normalize_email(email: str) -> str:
 def hash_password(password: str) -> str:
     encoded = password.encode("utf-8")
     if len(password) < 12 or len(encoded) > 72:
-        raise ValueError("Password must contain 12 to 72 characters.")
+        raise ValueError("Password must contain at least 12 characters and at most 72 UTF-8 bytes.")
     return bcrypt.hashpw(encoded, bcrypt.gensalt(rounds=12)).decode("ascii")
 
 

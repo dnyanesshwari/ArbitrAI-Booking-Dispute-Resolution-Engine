@@ -1,5 +1,6 @@
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,11 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import guardrails
 import main
 import ai
+import storage
 from google.genai.errors import ClientError, ServerError
 from models import AIAnalysis, Fact
-
-
-DATA_PATH = Path(main.storage.DATA_PATH)
 
 
 class ProviderErrorWithSecret(Exception):
@@ -32,7 +31,12 @@ def analysis_for(issue, recommendation, percent, *, refs=None, unknowns=None, co
 
 class DisputeScenarioTests(unittest.TestCase):
     def setUp(self):
-        self.original = DATA_PATH.read_text(encoding="utf-8")
+        self.sleep_patcher = patch("ai.time.sleep")
+        self.sleep_patcher.start()
+        self.original_data_path = Path(main.storage.DATA_PATH)
+        self.original = Path(storage.DATA_TEMPLATE_PATH).read_text(encoding="utf-8-sig")
+        self.temp_data_dir = tempfile.TemporaryDirectory()
+        main.storage.DATA_PATH = Path(self.temp_data_dir.name) / "data.json"
         self.fixture = json.loads(self.original)
         self.fixture["cases"] = [case for case in self.fixture["cases"] if case["id"] in {"C-1001", "C-1002", "C-1003", "C-1004", "C-1005"}]
         self.fixture["analyses"] = {key: value for key, value in self.fixture["analyses"].items() if key in {"C-1001", "C-1002", "C-1003", "C-1004", "C-1005"}}
@@ -40,19 +44,63 @@ class DisputeScenarioTests(unittest.TestCase):
         self.fixture.pop("decision_history", None)
         self.fixture["users"] = []
         self.fixture["sessions"] = {}
-        DATA_PATH.write_text(json.dumps(self.fixture), encoding="utf-8")
+        main.storage.DATA_PATH.write_text(json.dumps(self.fixture), encoding="utf-8")
         self.client = TestClient(main.app)
         main.auth.provision_admin("admin@example.test", "correct-horse-battery", "Test Admin")
         login = self.client.post("/api/auth/login", json={"email": "admin@example.test", "password": "correct-horse-battery"})
         self.assertEqual(login.status_code, 200)
 
     def tearDown(self):
-        DATA_PATH.write_text(self.original, encoding="utf-8")
+        self.sleep_patcher.stop()
+        main.storage.DATA_PATH = self.original_data_path
+        self.temp_data_dir.cleanup()
 
 
     def test_dispute_fixtures_are_the_five_supplied_scenarios(self):
         fixture_ids = {case["id"] for case in self.fixture["cases"]}
         self.assertEqual(fixture_ids, {"C-1001", "C-1002", "C-1003", "C-1004", "C-1005"})
+
+    def test_admin_verifies_submitted_evidence_and_audits_it(self):
+        case_id = "C-1001"
+        payload = {"reference": self.fixture["cases"][0]["evidence"][0], "evidence_type": "ticket", "claim": "Projector failed during the booking."}
+        response = self.client.post(f"/api/cases/{case_id}/evidence/verify", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["verified_by"], "Test Admin")
+        stored = main.storage.get_case(main.storage.load(), case_id)
+        self.assertEqual(stored["verified_evidence"][0]["verification_status"], "verified")
+        self.assertEqual(stored["audit_history"][-1]["event"], "evidence_verified")
+        self.assertEqual(self.client.post(f"/api/cases/{case_id}/evidence/verify", json={**payload, "reference": "other"}).status_code, 400)
+
+    def test_modify_refund_uses_case_facts_not_ai_citations(self):
+        case_id = "C-1003"
+        case = main.storage.get_case(main.storage.load(), case_id)
+        case["booking"]["cancelled_minutes_before"] = 120
+        proposal = analysis_for("cancellation", "no_refund", 0, refs=[])
+        result = guardrails.apply_guardrails(proposal, case, self.fixture["listings"][2])
+        data = main.storage.load()
+        data["cases"][2]["booking"]["cancelled_minutes_before"] = 120
+        data["analyses"][case_id] = result
+        main.storage.save(data)
+        response = self.client.post(f"/api/cases/{case_id}/decision", json={"action": "modify", "final_outcome": "partial_refund", "final_percent": 50, "admin_notes": "P3 supports this cancellation window."})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["final_percent"], 50)
+
+    def test_draft_messages_require_final_decision_and_use_templates(self):
+        case_id = "C-1003"
+        self.fixture["analyses"][case_id] = guardrails.apply_guardrails(
+            analysis_for("cancellation", "no_refund", 0, refs=[{"clause_id": "P3", "relevance": "cancellation"}]),
+            self.fixture["cases"][2], self.fixture["listings"][2])
+        data = main.storage.load()
+        data["analyses"][case_id] = self.fixture["analyses"][case_id]
+        main.storage.save(data)
+        response = self.client.post(f"/api/cases/{case_id}/draft-messages")
+        self.assertEqual(response.status_code, 409)
+        final = self.client.post(f"/api/cases/{case_id}/decision", json={"action": "modify", "final_outcome": "no_refund", "admin_notes": "P3 does not support a refund."})
+        self.assertEqual(final.status_code, 200)
+        drafts = self.client.post(f"/api/cases/{case_id}/draft-messages")
+        self.assertEqual(drafts.status_code, 200)
+        self.assertIn("no refund", drafts.json()["customer"])
+        self.assertIn("P3", drafts.json()["owner"])
 
     def test_all_supplied_scenarios_and_live_stats(self):
         cases = self.client.get("/api/cases").json()
@@ -97,7 +145,9 @@ class DisputeScenarioTests(unittest.TestCase):
         claimed = analysis_for("missing_amenity", "partial_refund", 30,
                                refs=[{"clause_id": "P1", "relevance": "claimed failure"}])
         claimed.verified_facts = [Fact(fact="Projector failure", source="Submitted evidence references")]
-        self.assertEqual(guardrails.apply_guardrails(claimed, not_admitted, fixture["listings"][0])["recommendation"], "manual_review")
+        guarded_claim = guardrails.apply_guardrails(claimed, not_admitted, fixture["listings"][0])
+        self.assertEqual(guarded_claim["recommendation"], "manual_review")
+        self.assertFalse(any("parking ticket" in fact["fact"].lower() for fact in guarded_claim["verified_facts"]))
 
         c2 = fixture["cases"][1].copy()
         c2["complaint"] = "I could not enter the reserved cabin."
@@ -155,6 +205,8 @@ class DisputeScenarioTests(unittest.TestCase):
         self.assertEqual(detail["case"]["status"], "Manual Review")
         self.assertEqual(self.client.get("/api/stats").json()["resolved_cases"], 0)
         self.assertEqual(self.client.get("/api/stats").json()["pending_reviews"], 5)
+        self.assertEqual(self.client.post(f"/api/cases/{case_id}/decision", json={"action": "approve", "admin_notes": "Attempt bypass"}).status_code, 409)
+        self.assertEqual(self.client.post(f"/api/cases/{case_id}/decision", json={"action": "reject", "admin_notes": "Repeat"}).status_code, 409)
         final = self.client.post(f"/api/cases/{case_id}/decision", json={
             "action": "modify", "final_outcome": "no_refund",
             "admin_notes": "Manual review confirmed the records.", "reviewer": "Reviewer"})
@@ -162,6 +214,23 @@ class DisputeScenarioTests(unittest.TestCase):
         self.assertEqual(final.json()["decision_status"], "finalized")
         history = main.storage.load()["decision_history"][case_id]
         self.assertEqual([item["decision_status"] for item in history], ["pending_manual_review", "finalized"])
+
+    def test_manual_review_outcome_stays_pending_until_a_final_outcome_is_recorded(self):
+        case_id = "C-1004"
+        proposal = analysis_for("property_damage", "manual_review", None,
+                               refs=[{"clause_id": "P4", "relevance": "Missing damage evidence"}])
+        with patch.object(main.ai, "analyze_case", return_value=proposal):
+            self.assertEqual(self.client.post(f"/api/cases/{case_id}/analyze").status_code, 200)
+        response = self.client.post(f"/api/cases/{case_id}/decision", json={
+            "action": "modify", "final_outcome": "manual_review", "admin_notes": "Request manual evidence review."})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["decision_status"], "pending_manual_review")
+        self.assertEqual(self.client.get(f"/api/cases/{case_id}").json()["case"]["status"], "Manual Review")
+        self.assertEqual(self.client.get("/api/stats").json()["resolved_cases"], 0)
+        final = self.client.post(f"/api/cases/{case_id}/decision", json={
+            "action": "modify", "final_outcome": "no_refund", "admin_notes": "Investigation did not establish a damage deduction."})
+        self.assertEqual(final.status_code, 200)
+        self.assertEqual(final.json()["decision_status"], "finalized")
 
     def test_critical_unknown_after_p3_cannot_be_overwritten_by_cancellation(self):
         case = dict(self.fixture["cases"][2])
@@ -171,6 +240,12 @@ class DisputeScenarioTests(unittest.TestCase):
         result = guardrails.apply_guardrails(proposal, case, self.fixture["listings"][2])
         self.assertEqual(result["recommendation"], "manual_review")
         self.assertIsNone(result["refund_percent"])
+
+    def test_p3_boundaries_match_supplied_policy(self):
+        self.assertEqual(guardrails.p3_expected_percent(24 * 60 + 1), 100)
+        self.assertEqual(guardrails.p3_expected_percent(24 * 60), 50)
+        self.assertEqual(guardrails.p3_expected_percent(2 * 60), 50)
+        self.assertEqual(guardrails.p3_expected_percent(2 * 60 - 1), 0)
 
     def test_listing_amenity_mention_is_not_failure_evidence(self):
         case = {"complaint": "The room was disappointing.", "owner_response": "We confirmed the booking.", "evidence": [], "booking": {"cancelled_minutes_before": None}}
@@ -190,6 +265,53 @@ class DisputeScenarioTests(unittest.TestCase):
         proposal = analysis_for("missing_amenity", "partial_refund", 30, refs=[{"clause_id": "P1", "relevance": "projector"}])
         proposal.verified_facts = [Fact(fact="Parking ticket #19 exists.", source="Submitted evidence references")]
         result = guardrails.apply_guardrails(proposal, case, self.fixture["listings"][0])
+        self.assertEqual(result["recommendation"], "manual_review")
+        self.assertFalse(any("parking ticket" in fact["fact"].lower() for fact in result["verified_facts"]))
+        self.assertTrue(any("parking ticket" in fact["fact"].lower() for fact in result["ai_asserted_facts"]))
+
+    def test_p1_counts_distinct_verified_amenities_not_evidence_items(self):
+        fixture = json.loads(self.original)
+        case = dict(fixture["cases"][0], complaint="I reported the issue at the front desk during the booking.",
+                    evidence=["ticket-1"], verified_evidence=[{
+                        "reference": "ticket-1", "evidence_type": "ticket", "claim": "Projector failed during presentation.",
+                        "verification_status": "verified", "verified_by": "admin-1", "verified_at": "2026-10-20T10:00:00+00:00"}])
+        proposal = analysis_for("missing_amenity", "partial_refund", 50,
+                               refs=[{"clause_id": "P1", "relevance": "One projector failure."}])
+        result = guardrails.apply_guardrails(proposal, case, fixture["listings"][0])
+        self.assertEqual((result["recommendation"], result["refund_percent"]), ("manual_review", None))
+        proposal.refund_percent = 30
+        result = guardrails.apply_guardrails(proposal, case, fixture["listings"][0])
+        self.assertEqual((result["recommendation"], result["refund_percent"]), ("partial_refund", 30))
+
+    def test_p1_calculates_two_distinct_verified_amenities(self):
+        fixture = json.loads(self.original)
+        refs = ["projector-ticket", "wifi-log"]
+        case = dict(fixture["cases"][0], complaint="I reported both failures during the booking.", owner_response="We disagree.",
+                    evidence=refs, verified_evidence=[
+                        {"reference": refs[0], "evidence_type": "ticket", "claim": "Projector failed.", "verification_status": "verified", "verified_by": "admin", "verified_at": "2026-10-20T10:00:00+00:00"},
+                        {"reference": refs[1], "evidence_type": "log", "claim": "Wi-Fi failed repeatedly.", "verification_status": "verified", "verified_by": "admin", "verified_at": "2026-10-20T10:01:00+00:00"},
+                    ])
+        proposal = analysis_for("missing_amenity", "partial_refund", 50,
+                               refs=[{"clause_id": "P1", "relevance": "Two amenities failed."}])
+        result = guardrails.apply_guardrails(proposal, case, fixture["listings"][0])
+        self.assertEqual((result["recommendation"], result["refund_percent"]), ("partial_refund", 50))
+
+    def test_invalid_policy_reference_is_removed_and_cannot_support_refund(self):
+        case = json.loads(self.original)["cases"][1]
+        proposal = analysis_for("access_failure", "full_refund", 100,
+                               refs=[{"clause_id": "PX", "relevance": "invented clause"}])
+        result = guardrails.apply_guardrails(proposal, case, self.fixture["listings"][1])
+        self.assertEqual(result["recommendation"], "manual_review")
+        self.assertEqual(result["policy_references"], [])
+
+    def test_unverified_claim_metadata_cannot_satisfy_p4(self):
+        fixture = json.loads(self.original)
+        case = dict(fixture["cases"][3], evidence=["damage-report.pdf"], verified_evidence=[{
+            "reference": "damage-report.pdf", "evidence_type": "log", "claim": "Damage observed.",
+            "verification_status": "verified", "verified_by": "admin", "verified_at": "2026-10-20T10:00:00+00:00"}])
+        proposal = analysis_for("property_damage", "no_refund", 0,
+                               refs=[{"clause_id": "P4", "relevance": "claim"}])
+        result = guardrails.apply_guardrails(proposal, case, fixture["listings"][3])
         self.assertEqual(result["recommendation"], "manual_review")
 
     def test_analysis_requires_complete_schema_and_wrong_percent_becomes_manual(self):
@@ -248,6 +370,12 @@ class DisputeScenarioTests(unittest.TestCase):
         with patch.object(main.ai, "analyze_case", side_effect=ai.ProviderFailure("malformed_output", "Invalid JSON", request_id="r-json", attempts=3)):
             response = self.client.post("/api/cases/C-1002/analyze")
         self.assertEqual(response.status_code, 502)
+
+        with patch.object(main.ai, "analyze_case", side_effect=ai.ProviderFailure("network", "Cannot reach Gemini", retryable=True, request_id="r-timeout", attempts=3)):
+            response = self.client.post("/api/cases/C-1002/analyze")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("network", response.json()["detail"])
+        self.assertIsNone(self.client.get("/api/cases/C-1002").json()["analysis"])
 
     def test_duplicate_case_and_policy_invalid_finalize_leave_data_unchanged(self):
         payload = {"customer": "Duplicate Test", "listing_id": "L1", "booking": {
@@ -318,6 +446,40 @@ class DisputeScenarioTests(unittest.TestCase):
         login = client.post("/api/auth/login", json={"email": "owner@example.test", "password": "a-long-password-123"})
         self.assertEqual(login.status_code, 200)
         self.assertEqual(client.get("/api/auth/me").json()["user"]["role"], "customer")
+
+    def test_expired_session_is_rejected(self):
+        token = self.client.cookies.get(main.auth.SESSION_COOKIE)
+        digest = __import__("hashlib").sha256(token.encode()).hexdigest()
+        data = main.storage.load()
+        data["sessions"][digest]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        main.storage.save(data)
+        self.assertEqual(self.client.get("/api/cases").status_code, 401)
+
+    def test_booking_input_rejects_invalid_date_time_and_amount(self):
+        payload = {"customer": "Test", "listing_id": "L1", "booking": {"amount": 10, "date": "2026-02-30", "time": "25:61", "space_type": "Meeting room"}, "complaint": "The booking was not usable."}
+        self.assertEqual(self.client.post("/api/cases", json=payload).status_code, 422)
+        payload["booking"].update({"date": "2026-10-20", "time": "10:00"})
+        payload["booking"]["amount"] = float("inf")
+        response = self.client.post("/api/cases", content=json.dumps(payload), headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 422)
+
+    def test_customer_to_admin_finalized_workflow_updates_both_views(self):
+        customer = TestClient(main.app)
+        self.assertEqual(customer.post("/api/auth/register", json={"email": "workflow@example.test", "password": "customer-password-123", "display_name": "Workflow Customer"}).status_code, 201)
+        payload = {"customer": "ignored", "listing_id": "L3", "booking": {"amount": 700, "date": "2026-10-20", "time": "10:00", "space_type": "Meeting room", "cancelled_minutes_before": 30}, "complaint": "I cancelled this booking 30 minutes before it started.", "owner_response": "The cancellation was received 30 minutes before start.", "evidence": []}
+        created = customer.post("/api/cases", json=payload)
+        self.assertEqual(created.status_code, 201)
+        case_id = created.json()["id"]
+        proposal = analysis_for("cancellation", "full_refund", 100, refs=[{"clause_id": "P3", "relevance": "30 minute cancellation"}])
+        with patch.object(main.ai, "analyze_case", return_value=proposal):
+            analyzed = self.client.post(f"/api/cases/{case_id}/analyze")
+        self.assertEqual(analyzed.status_code, 200)
+        self.assertEqual((analyzed.json()["recommendation"], analyzed.json()["refund_percent"]), ("no_refund", 0))
+        finalized = self.client.post(f"/api/cases/{case_id}/decision", json={"action": "approve", "admin_notes": "P3 applies to cancellation 30 minutes before the booking."})
+        self.assertEqual(finalized.status_code, 200)
+        customer_view = customer.get(f"/api/cases/{case_id}").json()
+        self.assertEqual(customer_view["case"]["status"], "Finalized")
+        self.assertEqual(customer_view["decision"]["final_outcome"], "no_refund")
 
     def test_unauthorized_customer_ownership_and_admin_permissions(self):
         anonymous = TestClient(main.app)

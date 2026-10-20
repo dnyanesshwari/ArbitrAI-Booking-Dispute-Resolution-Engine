@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { getCases, getListings, createCase } from "../api.js";
 
@@ -72,7 +72,7 @@ function IntakeForm({ listings, onCreated, onCancel }) {
           </select>
         </label>
         <label>Amount paid (Rs)
-          <input required type="number" min="1" value={form.amount} onChange={set("amount")} />
+          <input required type="number" min="0.01" step="0.01" value={form.amount} onChange={set("amount")} />
         </label>
         <label>Booking date
           <input required type="date" value={form.date} onChange={set("date")} />
@@ -110,6 +110,7 @@ export default function CaseList() {
   const [listings, setListings] = useState([]);
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
 
@@ -117,12 +118,22 @@ export default function CaseList() {
     try {
       setCases(await getCases());
       setListings(await getListings());
+      setError("");
     } catch (e) {
       setError(e.message);
+    } finally {
+      setLoading(false);
     }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    let active = true;
+    Promise.all([getCases(), getListings()]).then(([rows, availableListings]) => {
+      if (active) { setCases(rows); setListings(availableListings); setError(""); }
+    }).catch((e) => { if (active) setError(e.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
   const filteredCases = cases.filter((c) => {
     const matchesText = `${c.id} ${c.customer} ${c.listing_title}`.toLowerCase().includes(query.toLowerCase());
     return matchesText && (statusFilter === "all" || c.status === statusFilter);
@@ -132,10 +143,10 @@ export default function CaseList() {
     <>
       <div className="row between">
         <h2>Disputes</h2>
-        <button className="btn primary" onClick={() => setShowForm(true)}>+ New dispute</button>
+        <div className="row"><button className="btn" onClick={() => { setLoading(true); load(); }} disabled={loading}>{loading ? "Loadingâ€¦" : "Refresh"}</button><button className="btn primary" onClick={() => setShowForm(true)}>+ New dispute</button></div>
       </div>
-      <div className="toolbar"><input aria-label="Search disputes" placeholder="Search case, customer or listing" value={query} onChange={(e) => setQuery(e.target.value)} /><select aria-label="Filter by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="all">All statuses</option><option>New</option><option>AI Analyzed</option><option>Finalized</option></select></div>
-      {error && <p className="error">Could not load cases: {error}. Is the backend running?</p>}
+      <div className="toolbar"><input aria-label="Search disputes" placeholder="Search case, customer or listing" value={query} onChange={(e) => setQuery(e.target.value)} /><select aria-label="Filter by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option value="all">All statuses</option><option>New</option><option>AI Analyzed</option><option>Manual Review</option><option>Finalized</option></select></div>
+      {error && <p className="error" role="alert">Could not load cases: {error}. <button className="btn" onClick={load}>Retry</button></p>}
       {showForm && (
         <IntakeForm
           listings={listings}
@@ -151,6 +162,8 @@ export default function CaseList() {
           </tr>
         </thead>
         <tbody>
+          {loading && <tr><td colSpan="6" className="muted">Loading disputesâ€¦</td></tr>}
+          {!loading && !error && filteredCases.length === 0 && <tr><td colSpan="6" className="muted">{cases.length ? "No disputes match these filters." : "No disputes have been recorded."}</td></tr>}
           {filteredCases.map((c) => (
             <tr key={c.id}>
               <td><Link to={`/cases/${c.id}`}>{c.id}</Link></td>

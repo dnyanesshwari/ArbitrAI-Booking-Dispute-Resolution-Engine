@@ -20,6 +20,8 @@ export const getCase = (id) => request(`/cases/${id}`);
 export const analyzeCase = (id) => request(`/cases/${id}/analyze`, { method: "POST" });
 export const submitDecision = (id, payload) =>
   request(`/cases/${id}/decision`, { method: "POST", body: JSON.stringify(payload) });
+export const verifyEvidence = (id, payload) => request(`/cases/${id}/evidence/verify`, { method: "POST", body: JSON.stringify(payload) });
+export const getDraftMessages = (id) => request(`/cases/${id}/draft-messages`, { method: "POST" });
 
 export const getCurrentUser = () => request("/auth/me");
 export const register = (payload) => request("/auth/register", { method: "POST", body: JSON.stringify(payload) });

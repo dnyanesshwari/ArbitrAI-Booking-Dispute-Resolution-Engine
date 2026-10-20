@@ -1,11 +1,7 @@
-﻿export const OUTCOME_LABEL = {
-  full_refund: "Full refund",
-  partial_refund: "Partial refund",
-  no_refund: "No refund",
-  manual_review: "Manual investigation",
-};
+import { OUTCOME_LABEL } from "../outcomeLabels.js";
 
 export default function AIPanel({ analysis: a, listing, booking, evidence = [] }) {
+  const verifiedEvidence = new Map((a.verified_evidence ?? []).map((item) => [item.reference, item]));
   return (
     <div>
       <div className="banner pending">
@@ -41,8 +37,18 @@ export default function AIPanel({ analysis: a, listing, booking, evidence = [] }
         <h4>Evidence comparison</h4>
         <p><b>Listing promises:</b> {(listing?.promises ?? []).join(" / ") || "None recorded"}</p>
         <p><b>Booking record:</b> {booking?.space_type}, Rs {Number(booking?.amount ?? 0).toLocaleString("en-IN")} on {booking?.date} at {booking?.time}{booking?.cancelled_minutes_before != null ? ` / cancelled ${booking.cancelled_minutes_before} minutes before` : ""}</p>
-        <p><b>Submitted evidence:</b> {evidence.length ? evidence.join(" / ") : "None submitted"}</p>
+        <p><b>Evidence references and verification:</b></p>
+        {evidence.length ? <ul>{evidence.map((reference) => {
+          const verified = verifiedEvidence.get(reference);
+          return <li key={reference}>{reference} — {verified ? `Verified ${verified.evidence_type} by ${verified.verified_by}` : "Reference only; contents not inspected"}</li>;
+        })}</ul> : <p className="muted">None submitted</p>}
       </section>
+
+      {a.ai_asserted_facts?.length > 0 && <section className="box unverified-box">
+        <h4>AI assertions (not independently verified)</h4>
+        <p className="muted">These model statements are retained for review, but are not evidence by themselves.</p>
+        <ul>{a.ai_asserted_facts.map((fact, i) => <li key={i}>{fact.fact} <em>({fact.source})</em></li>)}</ul>
+      </section>}
 
       <div className="grid2">
         <div className="box facts-box">

@@ -9,3 +9,8 @@
 Backend/data.json
 Frontend/dist/
 Backend/data.json.tmp
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage

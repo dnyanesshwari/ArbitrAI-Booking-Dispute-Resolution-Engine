@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { getCase, analyzeCase, submitDecision } from "../api.js";
-import AIPanel, { OUTCOME_LABEL } from "../components/AIPanel.jsx";
+import { getCase, analyzeCase, submitDecision, verifyEvidence, getDraftMessages } from "../api.js";
+import AIPanel from "../components/AIPanel.jsx";
+import { OUTCOME_LABEL } from "../outcomeLabels.js";
 import DecisionControls from "../components/DecisionControls.jsx";
 
 export default function CaseDetail() {
@@ -9,16 +10,23 @@ export default function CaseDetail() {
   const [data, setData] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState("");
+  const [verification, setVerification] = useState({});
+  const [drafts, setDrafts] = useState(null);
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       setData(await getCase(id));
     } catch (e) {
       setError(e.message);
     }
-  }
+  }, [id]);
 
-  useEffect(() => { load(); }, [id]);
+  useEffect(() => {
+    let active = true;
+    getCase(id).then((result) => { if (active) setData(result); })
+      .catch((e) => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [id]);
 
   async function runAnalysis() {
     setAnalyzing(true);
@@ -39,7 +47,18 @@ export default function CaseDetail() {
     await load();
   }
 
-  if (!data) return <p>{error || "Loading..."}</p>;
+  async function handleVerification(reference) {
+    setError("");
+    try { await verifyEvidence(id, { reference, ...verification[reference] }); await load(); }
+    catch (e) { setError(e.message); }
+  }
+
+  async function loadDrafts() {
+    setError("");
+    try { setDrafts(await getDraftMessages(id)); } catch (e) { setError(e.message); }
+  }
+
+  if (!data || data.case.id !== id) return error ? <div><p className="error" role="alert">Could not load this case: {error}</p><button className="btn" onClick={load}>Retry</button></div> : <p className="muted">Loading case…</p>;
 
   const { case: c, listing, analysis, decision } = data;
   const finalized = c.status === "Finalized";
@@ -79,7 +98,15 @@ export default function CaseDetail() {
           <p className="quote owner">{c.owner_response || "No response provided."}</p>
           <h3>Submitted evidence</h3>
           {c.evidence.length ? (
-            <ul>{c.evidence.map((e) => <li key={e}>{e}</li>)}</ul>
+            <ul>{c.evidence.map((e) => {
+              const verified = (c.verified_evidence || []).some((item) => item.reference === e && item.verification_status === "verified");
+              return <li key={e}>{e}{verified ? <p className="muted">Verified</p> : !finalized && <form onSubmit={(event) => { event.preventDefault(); handleVerification(e); }}>
+                <label>Type <select required value={verification[e]?.evidence_type || ""} onChange={(event) => setVerification({ ...verification, [e]: { ...verification[e], evidence_type: event.target.value } })}><option value="">Select type</option>{["ticket", "photo", "log", "timestamped_record", "audio", "video"].map((type) => <option key={type}>{type}</option>)}</select></label>
+                <label>What does it verify? <input required value={verification[e]?.claim || ""} onChange={(event) => setVerification({ ...verification, [e]: { ...verification[e], claim: event.target.value } })} /></label>
+                <label>Evidence timestamp (optional) <input type="datetime-local" value={verification[e]?.evidence_timestamp || ""} onChange={(event) => setVerification({ ...verification, [e]: { ...verification[e], evidence_timestamp: event.target.value ? new Date(event.target.value).toISOString() : undefined } })} /></label>
+                <button className="btn" type="submit">Mark verified</button>
+              </form>}</li>;
+            })}</ul>
           ) : (
             <p className="muted">No evidence submitted.</p>
           )}
@@ -103,7 +130,7 @@ export default function CaseDetail() {
       </section>
 
       {analysis && !finalized && (
-        <DecisionControls analysis={analysis} onSubmit={handleDecision} />
+        <DecisionControls analysis={analysis} pendingManualReview={decision?.decision_status === "pending_manual_review"} onSubmit={handleDecision} />
       )}
       {analysis?.recommendation === "manual_review" && <section className="card"><h3>Manual investigation required</h3><p>Review the evidence gaps above. Then reject or modify the proposal and record your reason. Approval is unavailable for cases requiring manual review.</p></section>}
 
@@ -127,6 +154,8 @@ export default function CaseDetail() {
           <p className="muted">AI had proposed: {OUTCOME_LABEL[decision.ai_recommendation]}</p>
           {decision.admin_notes && <p>Notes: {decision.admin_notes}</p>}
           <p className="muted">Recorded {decision.finalized_at || decision.decided_at}. No real refund was processed.</p>
+          <button className="btn" onClick={loadDrafts}>Generate draft messages</button>
+          {drafts && <div><p><b>Draft, not sent · Customer</b> <button className="btn" onClick={() => navigator.clipboard.writeText(drafts.customer)}>Copy</button></p><p>{drafts.customer}</p><p><b>Draft, not sent · Owner</b> <button className="btn" onClick={() => navigator.clipboard.writeText(drafts.owner)}>Copy</button></p><p>{drafts.owner}</p></div>}
         </section>
       )}
     </>

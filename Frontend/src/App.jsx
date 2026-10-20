@@ -29,7 +29,7 @@ function Workspace({ user, onLogout }) {
     <aside className="sidebar">
       <Link to={isAdmin ? "/" : "/portal"} className="brand"><div className="brand-icon">A</div><div><h2>ArbitrAI</h2><span>Dispute Intelligence</span></div></Link>
       <p className="nav-label">WORKSPACE</p>
-      <nav>{isAdmin ? <><Link className={`nav-item ${location.pathname === "/" ? "active" : ""}`} to="/">▦ Dashboard</Link><Link className="nav-item" to="/">＋ Disputes</Link></> : <Link className={`nav-item ${location.pathname === "/portal" ? "active" : ""}`} to="/portal">Your disputes</Link>}</nav>
+      <nav>{isAdmin ? <Link className={`nav-item ${location.pathname === "/" ? "active" : ""}`} to="/">▦ Dashboard</Link> : <Link className={`nav-item ${location.pathname === "/portal" ? "active" : ""}`} to="/portal">Your disputes</Link>}</nav>
       <div className="sidebar-bottom"><div className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</div><div><strong>{user.display_name}</strong><span>{isAdmin ? "Administrator" : "Customer"}</span></div><button className="btn logout-button" onClick={signOut}>Log out</button></div>
     </aside>
     <main className="main-content">

@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import ai
@@ -17,11 +19,20 @@ import guardrails
 import storage
 import auth
 from ai import ProviderFailure
-from models import CaseCreate, CredentialsIn, DecisionIn, RegistrationIn
+from models import CaseCreate, CredentialsIn, DecisionIn, EvidenceVerifyIn, RegistrationIn
 
 logger = logging.getLogger("disputes.api")
 app = FastAPI(title="AI Booking Dispute & Resolution Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError):
+    # Excluding raw inputs avoids reflecting sensitive values and non-finite
+    # floats (which are not valid JSON) in validation responses.
+    detail = [{key: error[key] for key in ("loc", "msg", "type") if key in error}
+              for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": detail})
 
 
 def _now() -> str:
@@ -122,7 +133,13 @@ def create_case(body: CaseCreate, user: dict = Depends(auth.current_user)):
     if not storage.get_listing(data, body.listing_id):
         raise HTTPException(400, "Unknown listing_id")
     case = body.model_dump()
-    case["customer"] = user["display_name"]
+    submitted_name = body.customer.strip()
+    if user["role"] == "customer":
+        case["customer"] = user["display_name"]
+    else:
+        if not submitted_name:
+            raise HTTPException(422, "Customer display name is required")
+        case["customer"] = submitted_name
     case["owner_id"] = user["id"]
     fingerprint = _fingerprint(case)
     for existing in data["cases"]:
@@ -130,6 +147,7 @@ def create_case(body: CaseCreate, user: dict = Depends(auth.current_user)):
             return {**existing, "duplicate": True}
     next_num = max((int(c["id"].split("-")[1]) for c in data["cases"]), default=1000) + 1
     case.update({"id": f"C-{next_num}", "status": "New", "fingerprint": fingerprint,
+                 "created_at": _now(),
                  "audit_history": [{"event": "case_created", "at": _now()}]})
     data["cases"].append(case)
     storage.save(data)
@@ -152,6 +170,42 @@ def get_case(case_id: str, user: dict = Depends(auth.current_user)):
                 "final_percent": finalized_decision.get("final_percent")} if finalized_decision else None)}
     return {"case": case, "listing": storage.get_listing(data, case["listing_id"]),
             "analysis": data["analyses"].get(case_id), "decision": data["decisions"].get(case_id)}
+
+
+@app.post("/api/cases/{case_id}/evidence/verify")
+@_serialized_write
+def verify_evidence(case_id: str, body: EvidenceVerifyIn, user: dict = Depends(auth.require_admin)):
+    data = storage.load()
+    case = storage.get_case(data, case_id)
+    if not case:
+        raise HTTPException(404, "Case not found")
+    if case["status"] == "Finalized":
+        raise HTTPException(400, "Case is already finalized")
+    if body.reference not in case.get("evidence", []):
+        raise HTTPException(400, "Reference is not submitted for this case")
+    item = {**body.model_dump(), "verified_by": user["display_name"], "verified_at": _now(), "verification_status": "verified"}
+    case.setdefault("verified_evidence", []).append(item)
+    case.setdefault("audit_history", []).append({"event": "evidence_verified", "at": item["verified_at"], "reference": body.reference, "reviewer": user["display_name"]})
+    storage.save(data)
+    return item
+
+
+@app.post("/api/cases/{case_id}/draft-messages")
+@_serialized_write
+def draft_messages(case_id: str, user: dict = Depends(auth.require_admin)):
+    data = storage.load()
+    case = storage.get_case(data, case_id)
+    if not case:
+        raise HTTPException(404, "Case not found")
+    decision = data["decisions"].get(case_id)
+    if case["status"] != "Finalized" or not decision or decision.get("decision_status") != "finalized":
+        raise HTTPException(409, "Draft messages are available after the case is finalized")
+    outcome = decision["final_outcome"].replace("_", " ")
+    percent = decision.get("final_percent")
+    amount = f" at {percent}%" if percent is not None else ""
+    refs = ", ".join(ref["clause_id"] for ref in data.get("analyses", {}).get(case_id, {}).get("policy_references", [])) or "the recorded case review"
+    return {"customer": f"Hello {case['customer']}, your booking dispute has been reviewed. The final outcome is {outcome}{amount}. The decision was recorded under {refs}. No payment has been processed by this demonstration.",
+            "owner": f"Hello, the dispute for booking {case_id} has been reviewed. The final outcome is {outcome}{amount}, based on {refs}. No payment has been processed by this demonstration."}
 
 
 @app.post("/api/cases/{case_id}/analyze")
@@ -211,6 +265,10 @@ def decide(case_id: str, body: DecisionIn, user: dict = Depends(auth.require_adm
     if not body.admin_notes.strip():
         raise HTTPException(422, "Decision reason is required")
     reviewer_name = user["display_name"]
+    if case["status"] == "Manual Review" and body.action == "approve":
+        raise HTTPException(409, "This proposal is in manual review. Record a modified final outcome after investigation.")
+    if case["status"] == "Manual Review" and body.action == "reject":
+        raise HTTPException(409, "This case is already pending manual investigation.")
     if body.action == "reject":
         timestamp = _now()
         pending_review = {
@@ -232,7 +290,7 @@ def decide(case_id: str, body: DecisionIn, user: dict = Depends(auth.require_adm
             raise HTTPException(409, "This proposal requires manual investigation; approve is unavailable. Reject or modify it after review.")
     else:
         if not body.final_outcome:
-            raise HTTPException(400, "final_outcome is required for reject/modify")
+            raise HTTPException(400, "final_outcome is required for modify")
         else:
             outcome, percent = body.final_outcome, body.final_percent
             if outcome == "full_refund":
@@ -240,15 +298,39 @@ def decide(case_id: str, body: DecisionIn, user: dict = Depends(auth.require_adm
             elif outcome == "no_refund":
                 percent = 0
             elif outcome == "manual_review":
-                percent = None
+                if case["status"] == "Manual Review":
+                    raise HTTPException(409, "This case is already pending manual investigation.")
+                timestamp = _now()
+                pending_review = {
+                    "action": "modify", "final_outcome": "manual_review", "final_percent": None,
+                    "admin_notes": body.admin_notes.strip(), "reason": body.admin_notes.strip(),
+                    "reviewer": reviewer_name, "ai_recommendation": analysis["recommendation"],
+                    "ai_proposal_snapshot": analysis, "simulated": True, "decided_at": timestamp,
+                    "decision_status": "pending_manual_review",
+                }
+                data.setdefault("decision_history", {}).setdefault(case_id, []).append(pending_review)
+                data["decisions"][case_id] = pending_review
+                case["status"] = "Manual Review"
+                case.setdefault("audit_history", []).append({"event": "manual_review_requested", "at": timestamp, "reviewer": reviewer_name})
+                storage.save(data)
+                return pending_review
             elif percent not in {30, 50}:
                 raise HTTPException(400, "Partial refund must be 30% or 50% under policy. Other percentages are unsupported.")
     if outcome in {"full_refund", "partial_refund"}:
+        policy_ids = guardrails.valid_clause_ids()
         issue_categories = set(analysis.get("issue_categories", []))
-        cited = {ref.get("clause_id") for ref in analysis.get("policy_references", [])}
-        supported = ((outcome == "full_refund" and percent == 100 and (("P2" in cited and "access_failure" in issue_categories) or ("P3" in cited and "cancellation" in issue_categories)))
-                     or (outcome == "partial_refund" and percent in {30, 50} and "P1" in cited and "missing_amenity" in issue_categories)
-                     or (outcome == "partial_refund" and percent == 50 and "P3" in cited and "cancellation" in issue_categories))
+        listing = storage.get_listing(data, case["listing_id"])
+        verified = guardrails._verified_evidence(case)
+        amenities = guardrails._admitted_amenities(case, listing) | guardrails._evidenced_amenities(verified, listing)
+        minutes = case.get("booking", {}).get("cancelled_minutes_before")
+        p3_percent = guardrails.p3_expected_percent(minutes) if minutes is not None else None
+        access_text = f"{case.get('complaint', '')} {case.get('owner_response', '')}".lower()
+        p2_facts = "access_failure" in issue_categories and any(term in access_text for term in ("nobody offered", "no equivalent", "not offered", "no alternative", "denied access", "locked", "unavailable", "keycard"))
+        p3_facts = "cancellation" in issue_categories and p3_percent is not None
+        p1_facts = "missing_amenity" in issue_categories and bool(amenities) and bool(re.search(r"report(?:ed|ing)?|during the booking|front desk|ticket", case.get("complaint", ""), re.I))
+        supported = ((outcome == "full_refund" and percent == 100 and (("P2" in policy_ids and p2_facts) or ("P3" in policy_ids and p3_facts and p3_percent == 100)))
+                     or (outcome == "partial_refund" and percent in {30, 50} and "P1" in policy_ids and p1_facts and percent == (50 if len(amenities) >= 2 else 30))
+                     or (outcome == "partial_refund" and percent == 50 and "P3" in policy_ids and p3_facts and p3_percent == 50))
         if not supported:
             raise HTTPException(400, "The final refund outcome is not supported by this case's cited policy.")
     timestamp = _now()

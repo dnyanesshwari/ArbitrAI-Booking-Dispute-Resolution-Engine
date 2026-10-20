@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from pathlib import Path
 
 from models import AIAnalysis
@@ -33,11 +34,12 @@ def p3_expected_percent(minutes_before: int) -> int:
 
 
 def policy_references(analysis: dict) -> list[dict]:
+    available = valid_clause_ids()
     return [
         {"clause_id": ref["clause_id"], "rule": POLICY_RULES[ref["clause_id"]],
          "relevance": ref.get("relevance", "")}
         for ref in analysis.get("policy_references", [])
-        if ref.get("clause_id") in POLICY_RULES
+        if ref.get("clause_id") in available and ref.get("clause_id") in POLICY_RULES
     ]
 
 
@@ -47,24 +49,57 @@ def _verified_evidence(case: dict) -> list[dict]:
     Intake currently stores evidence references only. Those references, filenames,
     and their prose are never treated as inspected or verified artifacts.
     """
-    return [item for item in case.get("verified_evidence", [])
-            if isinstance(item, dict) and item.get("verified_by") and item.get("claim")]
+    verified = []
+    allowed_types = {"ticket", "photo", "log", "timestamped_record", "audio", "video"}
+    for item in case.get("verified_evidence", []):
+        if not isinstance(item, dict):
+            continue
+        evidence_type = str(item.get("evidence_type", "")).strip().lower()
+        if (item.get("verification_status") != "verified" or not item.get("verified_by")
+                or not item.get("verified_at") or not item.get("claim")
+                or evidence_type not in allowed_types
+                or item.get("reference") not in case.get("evidence", [])):
+            continue
+        try:
+            datetime.fromisoformat(str(item["verified_at"]).replace("Z", "+00:00"))
+            if item.get("evidence_timestamp"):
+                datetime.fromisoformat(str(item["evidence_timestamp"]).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        verified.append(item)
+    return verified
+
+
+def _mentions_promise(text: str, promise: str) -> bool:
+    ignored = {"with", "and", "the", "for", "up", "to", "high-speed", "listed", "every"}
+    terms = [term for term in re.findall(r"[a-z0-9-]+", promise.lower()) if term not in ignored and len(term) > 1]
+    return bool(terms and any(re.search(rf"\b{re.escape(term)}\b", text.lower()) for term in terms))
+
+
+def _evidenced_amenities(evidence: list[dict], listing: dict | None) -> set[str]:
+    eligible = {"ticket", "photo", "log", "timestamped_record"}
+    failure = re.compile(r"\b(?:fault|fail(?:ed|ure)?|broken|not working|malfunction(?:ed)?)\b", re.I)
+    promises = (listing or {}).get("promises", [])
+    return {promise for promise in promises if any(
+        item["evidence_type"].lower() in eligible
+        and _mentions_promise(item["claim"], promise)
+        and failure.search(item["claim"])
+        for item in evidence
+    )}
 
 
 def _admitted_amenities(case: dict, listing: dict | None) -> set[str]:
     """Find specific listed amenities explicitly admitted as failed by the owner."""
-    owner = case.get("owner_response", "").lower()
+    owner = str(case.get("owner_response", "")).lower()
     promises = listing.get("promises", []) if listing else []
     admissions = set()
     sentences = re.split(r"[.!?;\n]+", owner)
     for promise in promises:
         normalized = promise.lower()
-        terms = [term for term in re.findall(r"[a-z0-9-]+", normalized)
-                 if term not in {"with", "and", "the", "for", "up", "to", "high-speed", "listed"}]
-        if not terms:
+        if not _mentions_promise(owner, normalized):
             continue
         for sentence in sentences:
-            if not any(term in sentence for term in terms):
+            if not _mentions_promise(sentence, normalized):
                 continue
             if re.search(r"\b(?:not|never|no|deny|denied|disagree|didn't|doesn't|isn't|wasn't)\b", sentence):
                 continue
@@ -86,9 +121,10 @@ def apply_guardrails(analysis: AIAnalysis, case: dict, listing: dict | None = No
     cited = {ref["clause_id"] for ref in result["policy_references"]}
     issue = set(result["issue_categories"])
     verified_evidence = _verified_evidence(case)
-    evidence_claims = [item["claim"].lower() for item in verified_evidence]
     text = f"{case.get('complaint', '')} {case.get('owner_response', '')}".lower()
     admitted_amenities = _admitted_amenities(case, listing)
+    evidenced_amenities = _evidenced_amenities(verified_evidence, listing)
+    verified_amenities = admitted_amenities | evidenced_amenities
 
     def require_manual(reason: str) -> None:
         mandatory_manual.append(reason)
@@ -111,14 +147,17 @@ def apply_guardrails(analysis: AIAnalysis, case: dict, listing: dict | None = No
     # Apply deterministic listing-dependent P5 rule before mandatory conditions.
     if "noise" in issue and "P5" in cited:
         quiet_promise = bool(listing and any("quiet" in p.lower() for p in listing.get("promises", [])))
-        verified_noise = any("noise" in claim for claim in evidence_claims)
+        verified_noise = any(item["evidence_type"].lower() in {"audio", "video", "photo", "log", "timestamped_record"}
+                             and "noise" in item["claim"].lower() for item in verified_evidence)
         if quiet_promise and not verified_noise:
             require_manual("noise was promised against but no verified evidence supports the complaint (P5).")
         elif not quiet_promise:
             result["recommendation"], result["refund_percent"] = "no_refund", 0
             notes.append("Applied P5: the listing makes no quiet-environment promise, so no refund is due under this clause.")
 
-    if "property_damage" in issue and ("P4" not in cited or not any("damage" in claim for claim in evidence_claims)):
+    damage_evidence = any(item["evidence_type"].lower() == "photo" or bool(item.get("evidence_timestamp"))
+                          for item in verified_evidence)
+    if "property_damage" in issue and ("P4" not in cited or not damage_evidence):
         require_manual("property damage deduction requires explicitly verified photos or timestamped evidence (P4).")
 
     if "access_failure" in issue and "P2" in cited:
@@ -130,18 +169,16 @@ def apply_guardrails(analysis: AIAnalysis, case: dict, listing: dict | None = No
 
     if "missing_amenity" in issue:
         reported = bool(re.search(r"report(?:ed|ing)?|during the booking|front desk|ticket", case.get("complaint", "").lower()))
-        if "P1" not in cited or not (admitted_amenities or any("amenity" in claim or any(term in claim for term in (listing or {}).get("promises", [])) for claim in evidence_claims)):
+        if "P1" not in cited or not verified_amenities:
             require_manual("a specific amenity failure must be verified by evidence or an owner admission (P1).")
         if not reported:
             require_manual("P1 requires the amenity issue to have been reported during the booking.")
-        failure_count = len(admitted_amenities) + sum(
-            1 for claim in evidence_claims
-            if any(promise.lower() in claim for promise in (listing or {}).get("promises", []))
-        )
-        if failure_count and "P1" in cited:
+        failure_count = len(verified_amenities)
+        if failure_count and "P1" in cited and reported:
             expected = 50 if failure_count >= 2 else 30
-            if result["recommendation"] == "partial_refund" and result["refund_percent"] != expected:
-                require_manual(f"P1 supports {expected}% for {failure_count} explicitly verified amenity failure(s), not the proposed percentage.")
+            expected_outcome = "partial_refund"
+            if result["recommendation"] != expected_outcome or result["refund_percent"] != expected:
+                require_manual(f"P1 supports {expected}% for {failure_count} distinct verified amenity failure(s); the AI proposal did not match.")
 
     if any(unknown.get("critical") for unknown in result["unknowns"]):
         require_manual("a critical unknown remains (P6).")
@@ -150,10 +187,7 @@ def apply_guardrails(analysis: AIAnalysis, case: dict, listing: dict | None = No
 
     pct, rec = result["refund_percent"], result["recommendation"]
     allowed = {"P1": {30, 50}, "P2": {100}, "P3": {0, 50, 100}, "P5": {0}}
-    verified_p1 = bool(admitted_amenities or any(
-        any(promise.lower() in claim for promise in (listing or {}).get("promises", []))
-        for claim in evidence_claims
-    ))
+    verified_p1 = bool(verified_amenities)
     supporting = {pid for pid in cited if pct in allowed.get(pid, set()) and (
         (pid == "P1" and "missing_amenity" in issue and verified_p1)
         or (pid == "P2" and "access_failure" in issue)
@@ -176,11 +210,24 @@ def apply_guardrails(analysis: AIAnalysis, case: dict, listing: dict | None = No
         notes.extend(f"Manual review required: {reason}" for reason in dict.fromkeys(mandatory_manual))
 
     # Keep submitted references as references. AI facts are not promoted from filenames.
-    facts = result.get("verified_facts", [])
-    result["verified_facts"] = [fact for fact in facts if not (
-        "evidence" in fact.get("source", "").lower()
-        and re.search(r"\.(?:png|jpe?g|pdf|mp4|mov|txt|log)\b", fact.get("fact", ""), re.I)
-    )]
+    ai_asserted_facts = result.get("verified_facts", [])
+    result["ai_asserted_facts"] = ai_asserted_facts
+    booking = case.get("booking", {})
+    booking_parts = [f"Rs {booking['amount']}" for key in ("amount",) if booking.get(key) is not None]
+    booking_parts.extend(str(booking[key]) for key in ("space_type", "date", "time") if booking.get(key))
+    if booking.get("cancelled_minutes_before") is not None:
+        booking_parts.append(f"cancelled {booking['cancelled_minutes_before']} minutes before start")
+    verified_facts = ([{"fact": "Booking record (as submitted): " + ", ".join(booking_parts) + ".", "source": "Booking record (as submitted)"}]
+                      if booking_parts else [])
+    verified_facts.extend({"fact": f"The original listing promises: {promise}.", "source": "Original listing"}
+                          for promise in (listing or {}).get("promises", []))
+    verified_facts.extend({"fact": f"The owner explicitly admitted that the listed amenity failed: {promise}.",
+                           "source": "Specific owner admission"} for promise in sorted(admitted_amenities))
+    verified_facts.extend({"fact": item["claim"], "source": f"Verified {item['evidence_type']} ({item['verified_by']})"}
+                          for item in verified_evidence)
+    result["verified_facts"] = verified_facts
+    if ai_asserted_facts:
+        notes.append("Model-asserted facts are shown separately; verified facts are grounded in stored records or explicit verification.")
     result["verified_owner_admissions"] = sorted(admitted_amenities)
     result["owner_allegations"] = [allegation["claim"] for allegation in result.get("allegations", []) if allegation["made_by"] == "owner"]
     result["evidence_references"] = case.get("evidence", [])

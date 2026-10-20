@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { createCase, getCases, getListings } from "../api.js";
 
 const initial = { listing_id: "", amount: "", date: "", time: "", complaint: "", owner_response: "", evidence: "" };
@@ -12,8 +12,7 @@ export default function CustomerPortal({ user }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
-  async function load() {
-    setLoading(true);
+  const load = useCallback(async () => {
     try {
       const [ownCases, availableListings] = await Promise.all([getCases(), getListings()]);
       setCases(ownCases);
@@ -21,8 +20,15 @@ export default function CustomerPortal({ user }) {
       setError("");
     } catch (err) { setError(err.message); }
     finally { setLoading(false); }
-  }
-  useEffect(() => { load(); }, []);
+  }, []);
+  useEffect(() => {
+    let active = true;
+    Promise.all([getCases(), getListings()]).then(([ownCases, availableListings]) => {
+      if (active) { setCases(ownCases); setListings(availableListings); setError(""); }
+    }).catch((err) => { if (active) setError(err.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
 
   function set(key) { return (event) => setForm((current) => ({ ...current, [key]: event.target.value })); }
   async function submit(event) {
@@ -51,7 +57,7 @@ export default function CustomerPortal({ user }) {
       <h3>Submit a dispute</h3>
       <div className="grid2">
         <label>Listing<select required value={form.listing_id} onChange={set("listing_id")}><option value="">Select a listing…</option>{listings.map((listing) => <option key={listing.id} value={listing.id}>{listing.title}</option>)}</select></label>
-        <label>Amount paid (Rs)<input required type="number" min="1" step="0.01" value={form.amount} onChange={set("amount")} /></label>
+        <label>Amount paid (Rs)<input required type="number" min="0.01" step="0.01" value={form.amount} onChange={set("amount")} /></label>
         <label>Booking date<input required type="date" value={form.date} onChange={set("date")} /></label>
         <label>Start time<input required type="time" value={form.time} onChange={set("time")} /></label>
       </div>
@@ -64,9 +70,9 @@ export default function CustomerPortal({ user }) {
     </form>
 
     <section className="card customer-cases">
-      <div className="row between"><h3>Case status</h3><button className="btn" onClick={load} disabled={loading}>{loading ? "Refreshing…" : "Refresh"}</button></div>
+      <div className="row between"><h3>Case status</h3><button className="btn" onClick={() => { setLoading(true); load(); }} disabled={loading}>{loading ? "Refreshing…" : "Refresh"}</button></div>
       {loading ? <p className="muted">Loading your disputes…</p> : cases.length === 0 ? <p className="muted">You have not submitted any disputes yet.</p> : <div className="customer-case-list">{cases.map((item) => <article key={item.id} className="customer-case">
-        <div className="row between"><strong>{item.id} · {item.listing_title}</strong><span className={`badge ${item.status === "Finalized" ? "status-Finalized" : "status-New"}`}>{item.status}</span></div>
+        <div className="row between"><strong>{item.id} · {item.listing_title}</strong><span className={`badge status-${item.status.replace(" ", "")}`}>{item.status}</span></div>
         <p className="muted">Amount in dispute: Rs {Number(item.amount).toLocaleString("en-IN")}</p>
         {item.final_outcome && <p>Final outcome: <strong>{item.final_outcome.replaceAll("_", " ")}</strong></p>}
       </article>)}</div>}

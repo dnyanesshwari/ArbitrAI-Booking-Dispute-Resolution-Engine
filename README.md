@@ -336,9 +336,13 @@ Backend tests mock Gemini, so no API key is needed. They cover the five seeded s
 ---
 
 ## Screenshots
-
+**1. Dashboard**
 ![Admin dashboard](docs/dashboard.png)
+
+**2. AI investigation and decision**
 ![AI investigation and decision](docs/case-review.png)
+
+**3. Customer portal**
 ![Customer portal](docs/customer-portal.png)
 
 *ArbitrAI is a demonstration project. It does not process real payments or refunds and does not replace human judgment.*
